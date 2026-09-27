@@ -166,6 +166,19 @@ _ak = os.getenv("ONSHAPE_ACCESS_KEY") or os.getenv("ONSHAPE_API_KEY", "")
 _sk = os.getenv("ONSHAPE_SECRET_KEY") or os.getenv("ONSHAPE_API_SECRET", "")
 credentials = OnshapeCredentials(access_key=_ak, secret_key=_sk)
 client = OnshapeClient(credentials)
+
+
+def _default_track_changes() -> bool:
+    """Default for the `trackChanges` tool argument when the caller omits it.
+
+    Off by default: the before/after bodydetails + massproperties snapshot
+    costs up to 6 extra Onshape API calls per feature. Set
+    ONSHAPE_MCP_TRACK_CHANGES=true to opt in globally; individual calls can
+    still pass `trackChanges: true` regardless of this default.
+    """
+    return os.getenv("ONSHAPE_MCP_TRACK_CHANGES", "false").lower() == "true"
+
+
 partstudio_manager = PartStudioManager(client)
 variable_manager = VariableManager(client)
 document_manager = DocumentManager(client)
@@ -2109,12 +2122,14 @@ async def list_tools() -> list[Tool]:
                 "One-shot snapshot of a Part Studio's entire design state. Returns BOTH a "
                 "structured text representation (feature tree with statuses, body topology "
                 "with every face and edge classified by type + deterministic ID + "
-                "coordinates, bounding box, mass properties) AND the multi-view rendered "
-                "images (iso/top/front/right by default). Use this INSTEAD OF chaining "
-                "get_features + list_entities + render_part_studio_views + get_mass_properties "
-                "after every mutation. The text is what you reason over (reliable for you). "
-                "The images catch visual regressions the text misses. Image_ids returned "
-                "in the text can be cropped via crop_image."
+                "coordinates, bounding box, mass properties) AND the rendered "
+                "image(s) (iso-only by default; pass `views` for more). Use this INSTEAD OF "
+                "chaining get_features + list_entities + render_part_studio_views + "
+                "get_mass_properties after every mutation. The text is what you reason over "
+                "(reliable for you). The image(s) catch visual regressions the text misses. "
+                "Image_ids returned in the text can be cropped via crop_image. Pass "
+                "`skipRenders` / `skipMassProperties` to skip those API calls entirely when "
+                "you only need the feature tree and topology."
             ),
             inputSchema={
                 "type": "object",
@@ -2125,11 +2140,21 @@ async def list_tools() -> list[Tool]:
                     "views": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "default": ["iso", "top", "front", "right"],
-                        "description": "Named views to render (iso/top/front/back/left/right/bottom).",
+                        "default": ["iso"],
+                        "description": "Named views to render (iso/top/front/back/left/right/bottom). Defaults to iso-only to save API calls; pass e.g. [\"iso\",\"top\",\"front\",\"right\"] for the fuller bundle.",
                     },
                     "renderWidth": {"type": "integer", "default": 1200},
                     "renderHeight": {"type": "integer", "default": 800},
+                    "skipRenders": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Skip rendering entirely (no image, no render API call). Use when you only need the text snapshot.",
+                    },
+                    "skipMassProperties": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Skip the mass-properties API call. Use when you don't need volume/mass/centroid.",
+                    },
                 },
                 "required": ["documentId", "workspaceId", "elementId"],
             },
@@ -2187,6 +2212,16 @@ async def list_tools() -> list[Tool]:
                 "metadata (view, source part studio, dimensions, crop lineage). Use to "
                 "recover an image_id you need to crop or re-render, or to audit what "
                 "you've looked at so far."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="get_api_call_count",
+            description=(
+                "Return how many real Onshape REST API calls this session has made so "
+                "far (counts every GET/POST/DELETE round trip, including failed ones; "
+                "never incremented by a cache hit). Use to track usage against your "
+                "Onshape API budget."
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -2485,6 +2520,7 @@ def _feature_apply_json(
         "feature_type": result.feature_type,
         "feature_name": result.feature_name,
         "error_message": result.error_message,
+        "api_calls_this_session": client.call_count,
     }
     if tool_name:
         payload["tool"] = tool_name
@@ -2919,7 +2955,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 arguments["workspaceId"],
                 arguments["elementId"],
                 extrude.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(
                 result, tool_name=name, notes=notes,
@@ -2955,7 +2991,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 arguments["workspaceId"],
                 arguments["elementId"],
                 {"feature": thicken.build()},
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except KeyError:
@@ -4311,7 +4347,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 fillet.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
@@ -4332,7 +4368,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 chamfer.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except KeyError:
@@ -4363,7 +4399,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 shell.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
@@ -4425,7 +4461,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 revolve.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except KeyError:
@@ -4458,7 +4494,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 pattern.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
@@ -4481,7 +4517,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 pattern.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
@@ -4502,7 +4538,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 client,
                 arguments["documentId"], arguments["workspaceId"], arguments["elementId"],
                 boolean.build(),
-                track_changes=bool(arguments.get("trackChanges", True)),
+                track_changes=bool(arguments.get("trackChanges", _default_track_changes())),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except KeyError:
@@ -5134,6 +5170,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 views=arguments.get("views") or None,
                 render_width=int(arguments.get("renderWidth", 1200)),
                 render_height=int(arguments.get("renderHeight", 800)),
+                skip_renders=bool(arguments.get("skipRenders", False)),
+                skip_mass_properties=bool(arguments.get("skipMassProperties", False)),
             )
             out: list[TextContent | ImageContent] = [
                 TextContent(type="text", text=snap.structured_text)
@@ -5205,6 +5243,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 f"  - {e['image_id']}: view={view} source={src.get('kind','?')}:{src.get('eid','?')} {dims} {e['bytes']}B{crop_note}"
             )
         return [TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "get_api_call_count":
+        return [TextContent(
+            type="text",
+            text=json.dumps({"api_calls_this_session": client.call_count}, indent=2),
+        )]
 
     elif name == "write_featurescript_feature":
         try:

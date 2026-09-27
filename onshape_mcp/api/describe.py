@@ -39,6 +39,15 @@ class PartStudioSnapshot:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+async def _immediate(value):
+    """Wrap an already-known value as a coroutine for asyncio.gather.
+
+    Used to give skip_renders / skip_mass_properties a task that resolves
+    without ever calling the network method it stands in for.
+    """
+    return value
+
+
 def _fmt_mm(x: Optional[float]) -> str:
     if x is None:
         return "?"
@@ -336,14 +345,22 @@ class DescribeManager:
         views: Optional[List[str]] = None,
         render_width: int = 1200,
         render_height: int = 800,
+        skip_renders: bool = False,
+        skip_mass_properties: bool = False,
     ) -> PartStudioSnapshot:
         """Snapshot the current design state.
 
         Fires all the independent reads in parallel (bodydetails, features,
         bbox, massproperties, multi-view render), then assembles both
         representations. ~1-2s total even for complex parts.
+
+        `views` defaults to iso-only to keep the render cheap; pass an
+        explicit list (e.g. `["iso", "top", "front", "right"]`) for the fuller
+        bundle. `skip_renders` / `skip_mass_properties` skip firing those
+        requests entirely — not just discarding the result — for callers that
+        only want the feature tree and topology.
         """
-        views = list(views) if views else ["iso", "top", "front", "right"]
+        views = list(views) if views else ["iso"]
 
         features_task = asyncio.create_task(
             self.partstudio.get_features(document_id, workspace_id, element_id)
@@ -356,12 +373,16 @@ class DescribeManager:
         )
         mass_task = asyncio.create_task(
             self._mass_props_safe(document_id, workspace_id, element_id)
+            if not skip_mass_properties
+            else _immediate({})
         )
         render_task = asyncio.create_task(
             self.renderer.render_part_studio_views(
                 document_id, workspace_id, element_id,
                 views=views, width=render_width, height=render_height,
             )
+            if not skip_renders
+            else _immediate([])
         )
         # Face-area probe rides alongside the other independent reads; FS eval
         # is cheap (~50ms) and gives us min/max face area for the physical
@@ -399,6 +420,7 @@ class DescribeManager:
             _mass_props_text(mass_raw),
             "VIEWS RENDERED:",
             *[f"  {r.view}: image_id={r.image_id} ({r.width}x{r.height}, {r.bytes}B)" for r in rendered],
+            f"API CALLS THIS SESSION: {self.client.call_count}",
         ]
         structured_text = "\n\n".join(sections)
 
@@ -411,6 +433,7 @@ class DescribeManager:
                 "bbox": bbox,
                 "mass_properties": mass_raw,
                 "face_areas": face_areas,
+                "api_calls_this_session": self.client.call_count,
             },
         )
 

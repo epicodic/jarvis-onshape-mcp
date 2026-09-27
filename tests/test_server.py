@@ -7,6 +7,7 @@ from mcp.types import Tool, TextContent
 
 # Import the server module components
 from onshape_mcp.server import list_tools, call_tool, _extract_offsets
+from onshape_mcp import server as server_module
 from onshape_mcp.api.variables import Variable
 from onshape_mcp.api.documents import DocumentInfo, ElementInfo
 
@@ -218,7 +219,10 @@ class TestCreateSketchRectangle:
         # Verify the stable-contract fields. `hints` is also emitted by
         # _feature_apply_json now (status-based next-action pointers); drop
         # it from the equality check since its content rotates over time.
+        # `api_calls_this_session` is session-global counter state, dropped
+        # for the same reason.
         parsed.pop("hints", None)
+        parsed.pop("api_calls_this_session", None)
         assert parsed == {
             "ok": True,
             "status": "OK",
@@ -2781,3 +2785,151 @@ class TestUnknownTool:
         """Test calling an unknown tool."""
         with pytest.raises(ValueError, match="Unknown tool"):
             await call_tool("unknown_tool", {})
+
+
+class TestTrackChangesDefaultsOff:
+    """trackChanges must default to False unless the caller opts in explicitly.
+
+    Regression for the API-budget bug: these tools used to pass
+    track_changes=True whenever the caller omitted `trackChanges`, burning up
+    to 6 extra Onshape API calls per feature (before/after bodydetails +
+    massproperties snapshots) even when nobody asked for a diff.
+    """
+
+    _CASES = [
+        ("create_extrude", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "sketchFeatureId": "sketch1", "depth": 5.0,
+        }),
+        ("create_thicken", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "sketchFeatureId": "sketch1", "thickness": 0.5,
+        }),
+        ("create_fillet", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "radius": 0.25, "edgeIds": ["edge1"],
+        }),
+        ("create_chamfer", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "distance": 0.1, "edgeIds": ["edge1"],
+        }),
+        ("create_shell", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "thickness": 1.0, "faceIds": ["face1"],
+        }),
+        ("create_revolve", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "sketchFeatureId": "sketch1", "axis": "Y", "angle": 360,
+        }),
+        ("create_linear_pattern", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "distance": 2.0, "count": 5, "featureIds": ["f1"],
+            "directionEdgeId": "EDGE1",
+        }),
+        ("create_circular_pattern", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "count": 6, "featureIds": ["f1"],
+        }),
+        ("create_boolean", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "booleanType": "UNION", "toolBodyIds": ["b1", "b2"],
+        }),
+    ]
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
+    async def test_defaults_to_false_when_omitted(self, mock_apply):
+        mock_apply.return_value = _mock_apply_result()
+        for tool_name, args in self._CASES:
+            mock_apply.reset_mock()
+            await call_tool(tool_name, dict(args))
+            assert mock_apply.call_args.kwargs["track_changes"] is False, (
+                f"{tool_name}: trackChanges should default to False"
+            )
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
+    async def test_explicit_true_is_honored(self, mock_apply):
+        mock_apply.return_value = _mock_apply_result()
+        for tool_name, args in self._CASES:
+            mock_apply.reset_mock()
+            await call_tool(tool_name, {**args, "trackChanges": True})
+            assert mock_apply.call_args.kwargs["track_changes"] is True, (
+                f"{tool_name}: explicit trackChanges=True must be honored"
+            )
+
+
+class TestApiCallCounterVisibility:
+    """The REST call counter must be visible from the tool layer: in every
+    mutating tool's JSON response, and via a small dedicated tool."""
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
+    @patch("onshape_mcp.server.partstudio_manager")
+    async def test_feature_apply_json_reports_call_count(self, mock_partstudio, mock_apply, monkeypatch):
+        monkeypatch.setattr(server_module.client, "call_count", 7)
+        mock_partstudio.get_plane_id = AsyncMock(return_value="plane123")
+        mock_apply.return_value = _mock_apply_result(feature_id="f1", feature_name="S")
+
+        result = await call_tool("create_sketch_rectangle", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "corner1": [0, 0], "corner2": [1, 1],
+        })
+
+        import json as _json
+        parsed = _json.loads(result[0].text)
+        assert parsed["api_calls_this_session"] == 7
+
+    @pytest.mark.asyncio
+    async def test_get_api_call_count_tool_reports_current_count(self, monkeypatch):
+        monkeypatch.setattr(server_module.client, "call_count", 42)
+
+        result = await call_tool("get_api_call_count", {})
+
+        import json as _json
+        parsed = _json.loads(result[0].text)
+        assert parsed["api_calls_this_session"] == 42
+
+    @pytest.mark.asyncio
+    async def test_get_api_call_count_tool_is_listed(self):
+        tools = await list_tools()
+        tool_names = [tool.name for tool in tools]
+        assert "get_api_call_count" in tool_names
+
+
+class TestDescribePartStudioApiBudgetWiring:
+    """The describe_part_studio tool must expose the new iso-only default and
+    skip flags through to DescribeManager, not just at the library level."""
+
+    @staticmethod
+    def _mock_snapshot():
+        from onshape_mcp.api.describe import PartStudioSnapshot
+        return PartStudioSnapshot(structured_text="text", views=[], raw={})
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.describe_manager")
+    async def test_default_call_uses_iso_only_and_no_skips(self, mock_describe):
+        mock_describe.describe_part_studio = AsyncMock(return_value=self._mock_snapshot())
+
+        await call_tool("describe_part_studio", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+        })
+
+        kwargs = mock_describe.describe_part_studio.call_args.kwargs
+        assert kwargs["views"] is None or kwargs["views"] == ["iso"]
+        assert kwargs.get("skip_renders", False) is False
+        assert kwargs.get("skip_mass_properties", False) is False
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.describe_manager")
+    async def test_skip_flags_are_passed_through(self, mock_describe):
+        mock_describe.describe_part_studio = AsyncMock(return_value=self._mock_snapshot())
+
+        await call_tool("describe_part_studio", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "skipRenders": True, "skipMassProperties": True,
+        })
+
+        kwargs = mock_describe.describe_part_studio.call_args.kwargs
+        assert kwargs["skip_renders"] is True
+        assert kwargs["skip_mass_properties"] is True

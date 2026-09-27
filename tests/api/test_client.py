@@ -269,3 +269,155 @@ class TestOnshapeClient:
 
         # Verify path is appended correctly
         # This is tested indirectly through the get/post/delete methods
+
+
+class TestOnshapeClientCallCount:
+    """A per-session REST call counter, so the API budget is visible.
+
+    Onshape's plan caps calls (2,500/period on a Free account); previously
+    there was no way to see how much of that budget a session had burned.
+    """
+
+    def test_starts_at_zero(self, onshape_client):
+        assert onshape_client.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_get_increments_call_count(self, onshape_client, mock_httpx_client):
+        """Two DISTINCT GETs each count; see TestOnshapeClientGetCache for the
+        (intentional) cache-hit behavior of two identical ones."""
+        mock_response = Mock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        await onshape_client.get("/api/test")
+        assert onshape_client.call_count == 1
+        await onshape_client.get("/api/test-2")
+        assert onshape_client.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_post_increments_call_count(self, onshape_client, mock_httpx_client):
+        mock_response = Mock()
+        mock_response.json.return_value = {"created": True}
+        mock_response.raise_for_status.return_value = None
+        mock_response.status_code = 200
+        mock_response.text = ""
+        mock_httpx_client.post.return_value = mock_response
+
+        await onshape_client.post("/api/create", data={"a": 1})
+        assert onshape_client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_increments_call_count(self, onshape_client, mock_httpx_client):
+        mock_response = Mock()
+        mock_response.json.return_value = {"deleted": True}
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.delete.return_value = mock_response
+
+        await onshape_client.delete("/api/resource/123")
+        assert onshape_client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_raw_increments_call_count(self, onshape_client, mock_httpx_client):
+        mock_response = Mock()
+        mock_response.content = b"raw bytes"
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        await onshape_client.get_raw("/api/v6/documents/d/abc/externaldata/fid")
+        assert onshape_client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_counts_even_on_http_error(self, onshape_client, mock_httpx_client):
+        """A rejected request still spent budget against Onshape's API cap."""
+        mock_response = Mock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Not Found", request=Mock(), response=Mock(status_code=404)
+        )
+        mock_httpx_client.get.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await onshape_client.get("/api/test")
+
+        assert onshape_client.call_count == 1
+
+
+class TestOnshapeClientGetCache:
+    """A short-TTL cache on `get()` dedupes the repeated re-fetches that
+    happen within one tool call (e.g. describe_part_studio's parallel reads,
+    apply_feature_and_check's fallback /features GET) without serving stale
+    data across a whole conversation."""
+
+    @pytest.mark.asyncio
+    async def test_second_identical_get_within_ttl_is_a_cache_hit(
+        self, onshape_client, mock_httpx_client
+    ):
+        mock_response = Mock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        first = await onshape_client.get("/api/test")
+        second = await onshape_client.get("/api/test")
+
+        assert first == second == {"data": "test"}
+        mock_httpx_client.get.assert_called_once()
+        assert onshape_client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_different_params_are_not_cache_hits(
+        self, onshape_client, mock_httpx_client
+    ):
+        mock_response = Mock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        await onshape_client.get("/api/test", params={"a": 1})
+        await onshape_client.get("/api/test", params={"a": 2})
+
+        assert mock_httpx_client.get.call_count == 2
+        assert onshape_client.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_entry_expires_after_ttl(self, onshape_client, mock_httpx_client):
+        onshape_client._get_cache_ttl_seconds = 0
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        await onshape_client.get("/api/test")
+        await onshape_client.get("/api/test")
+
+        assert mock_httpx_client.get.call_count == 2
+        assert onshape_client.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_raw_is_never_cached(self, onshape_client, mock_httpx_client):
+        mock_response = Mock()
+        mock_response.content = b"raw bytes"
+        mock_response.raise_for_status.return_value = None
+        mock_httpx_client.get.return_value = mock_response
+
+        await onshape_client.get_raw("/api/v6/documents/d/abc/externaldata/fid")
+        await onshape_client.get_raw("/api/v6/documents/d/abc/externaldata/fid")
+
+        assert mock_httpx_client.get.call_count == 2
+        assert onshape_client.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_post_is_never_cached(self, onshape_client, mock_httpx_client):
+        mock_response = Mock()
+        mock_response.json.return_value = {"created": True}
+        mock_response.raise_for_status.return_value = None
+        mock_response.status_code = 200
+        mock_response.text = ""
+        mock_httpx_client.post.return_value = mock_response
+
+        await onshape_client.post("/api/create", data={"a": 1})
+        await onshape_client.post("/api/create", data={"a": 1})
+
+        assert mock_httpx_client.post.call_count == 2
+        assert onshape_client.call_count == 2

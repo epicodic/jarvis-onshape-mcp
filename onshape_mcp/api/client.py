@@ -1,8 +1,11 @@
 """Onshape API client for REST API communication."""
 
 import base64
+import json
+import os
+import time
 import httpx
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from pydantic import BaseModel
 from loguru import logger
 
@@ -33,6 +36,14 @@ class OnshapeClient:
         self.base_url = credentials.base_url
         self._client: Optional[httpx.AsyncClient] = None
         self._own_client = False
+        self.call_count = 0
+        """Real HTTP round trips made this session (counts even on 4xx/5xx —
+        Onshape's API budget charges for the request regardless of status).
+        Never incremented by a cache hit."""
+        self._get_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._get_cache_ttl_seconds = float(
+            os.getenv("ONSHAPE_MCP_GET_CACHE_TTL_SECONDS", "5")
+        )
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -94,8 +105,17 @@ class OnshapeClient:
             return result[:max_length] + "... (truncated)"
         return result
 
+    def _get_cache_key(self, path: str, params: Optional[Dict[str, Any]]) -> str:
+        return f"{path}?{json.dumps(params, sort_keys=True, default=str)}"
+
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Make a GET request to Onshape API.
+
+        Cached for `_get_cache_ttl_seconds` (short — meant to dedupe the
+        repeated re-fetches that happen within one tool call, e.g.
+        describe_part_studio's parallel reads, not to serve stale data
+        across a multi-step conversation). A cache hit never touches
+        `call_count`.
 
         Args:
             path: API endpoint path (e.g., "/api/v9/documents")
@@ -104,6 +124,14 @@ class OnshapeClient:
         Returns:
             JSON response data
         """
+        cache_key = self._get_cache_key(path, params)
+        cached = self._get_cache.get(cache_key)
+        if cached is not None:
+            cached_at, cached_result = cached
+            if time.monotonic() - cached_at < self._get_cache_ttl_seconds:
+                logger.debug(f"GET {path}: cache hit")
+                return cached_result
+
         url = f"{self.base_url}{path}"
         headers = {
             "Authorization": self._get_auth_header(),
@@ -113,9 +141,11 @@ class OnshapeClient:
         self._ensure_client()
         logger.debug(f"GET {url} with params: {self._sanitize_for_logging(params)}")
         response = await self._client.get(url, params=params, headers=headers)
+        self.call_count += 1
         response.raise_for_status()
         result = response.json()
         logger.debug(f"GET {url} response: {self._sanitize_for_logging(result, max_length=500)}")
+        self._get_cache[cache_key] = (time.monotonic(), result)
         return result
 
     async def get_raw(
@@ -148,6 +178,7 @@ class OnshapeClient:
         response = await self._client.get(
             url, params=params, headers=headers, follow_redirects=follow_redirects
         )
+        self.call_count += 1
         response.raise_for_status()
         logger.debug(f"GET (raw) {url} returned {len(response.content)} bytes")
         return response.content
@@ -179,6 +210,7 @@ class OnshapeClient:
         logger.debug(f"POST {url} with params: {self._sanitize_for_logging(params)}")
         logger.debug(f"POST {url} data: {self._sanitize_for_logging(data, max_length=1000)}")
         response = await self._client.post(url, json=data, params=params, headers=headers)
+        self.call_count += 1
 
         # Log error details if request failed
         if response.status_code >= 400:
@@ -218,6 +250,7 @@ class OnshapeClient:
 
         self._ensure_client()
         response = await self._client.delete(url, params=params, headers=headers)
+        self.call_count += 1
         response.raise_for_status()
         if not response.content:
             return {}
